@@ -135,9 +135,13 @@ site runs --project toy;  site logs <run>;  site fetch <run>
 
 ## Status and limits
 
-- Extracted from one person's setup and tested here only offline (`tests/test_kit.py`: install, plan CLI, guard
-  verdicts). The cluster paths (`sync`, `pick`, `submit`, `supervise`) are the code that runs in production, but this
-  copy has not yet been run against a cluster on someone else's account.
+- Extracted from one person's setup. Offline tests: `tests/test_kit.py` (install, plan CLI, guard verdicts).
+  On a cluster: this copy took `examples/toy` end to end on one Slurm site (CC-IN2P3) under a fresh install with the
+  ledger off: `site env` as a CPU job, `pick`, the probe and the toy fit on a GPU, `supervise` sorting the run ends,
+  `fetch`.
+- **Untested on a cluster:** the site-side gate (`site_gate.py` refusing an `sbatch`/`condor_submit` without a work
+  item or over the GPU budget) and work items (`site decide`, `site item`), since both need the ledger on; HTCondor
+  sites; more than one site at a time.
 - `bin/site` is one large file; splitting it into modules is welcome.
 - The workflow assumes one development branch per project, `trunk`, which every site checks out.
 - The kit keeps its state on each site under `~/.ccorch`; set `CCORCH_REMOTE_DIR` (e.g. `.ccorch_kit`) to keep a
