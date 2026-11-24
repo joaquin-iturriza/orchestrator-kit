@@ -559,6 +559,9 @@ def send_bundle(sc, wc, branch, stage, remote_path, sha, have, a):
     site's stage commit) when this checkout has it, else the whole branch."""
     full = local(["git", "-C", wc, "rev-parse", branch]).strip()
     if have and have == full:
+        # the site has the commit (a fresh checkout's HEAD stands in for a missing stage ref): point the ref at it,
+        # or the fast-forward that follows finds no stage ref to merge
+        run_ssh(sc, "git -C %s update-ref %s %s" % (shlex.quote(remote_path), stage, full), timeout=a.timeout)
         return
     base = have if have and subprocess.run(["git", "-C", wc, "merge-base", "--is-ancestor", have, branch],
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else ""
@@ -4220,10 +4223,12 @@ def supervise_pass(project=None, log=print, beat=True):
         ids = [i["id"] for i in active] + [i["id"] for i in _items(c, name, ("held",))]
         rx_cache = {}
         pend_groups = {}
-        if ids:
-            rows = c.execute("SELECT id,site,sched_id,state,submitted,item FROM runs WHERE project=? AND item IN (%s) "
+        # a project without the ledger has no items: its runs (item NULL) are watched as one
+        free = not ledger_on(name)
+        if ids or free:
+            rows = c.execute("SELECT id,site,sched_id,state,submitted,item FROM runs WHERE project=? AND (item IN (%s)%s) "
                              "AND (state NOT IN (%s) OR id || ':' || state NOT IN (SELECT key FROM events WHERE kind='RUN'))"
-                             % (",".join("?" * len(ids)), ",".join("?" * len(TERMINAL))),
+                             % (",".join("?" * len(ids)), " OR item IS NULL" if free else "", ",".join("?" * len(TERMINAL))),
                              [name] + ids + list(TERMINAL)).fetchall()
             for rid, site, sched_id, old, sub, item in rows:
                 sc = site_of(site)

@@ -9,4 +9,4 @@
 _CCORCH_ROOT="${CCORCH_PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)}}"
 source "$_CCORCH_ROOT/sites/activate.sh"
 cd "$PROJECT_DIR"
-python train.py --steps "${STEPS:-500}" --seed "${SEED:-0}" --out "$SCRATCH/toy_${SLURM_JOB_ID:-local}"
+python train.py --steps "${STEPS:-500}" --seed "${SEED:-0}" --out "runs/toy_${SLURM_JOB_ID:-local}"   # under the checkout: site fetch looks there
