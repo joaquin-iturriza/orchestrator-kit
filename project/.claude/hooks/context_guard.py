@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Context guard: before the main session's context is compacted, what the compaction would lose is on the plan or
+the ledger.
+
+Over the main session's messages since its last compaction, the turn cannot end, and an automatic compaction is held,
+while
+  - a question the main session put to the user has no `plan ask` (or `plan answer`, `plan withdraw`) recording it;
+  - a decision of the user's (approve, hold, release, forbid, prefer, scope; never a complaint or a correction) has no
+    `site decide` (or `plan answer`) recording it;
+  - a commitment in a main-session message ("I'll do X") has no plan step (`plan add-next|set-next|step|wait|add`)
+    and was not done later in the window.
+A model (reply_check's sonnet call) reads the user's messages, the main session's text and the recording commands,
+and lists each omission with a quote; an item stands only when its quote is in the window. Any failure of the model
+passes: the check never stalls the compaction or the turn.
+
+  PreCompact    (trigger "auto") omissions found: refuse (exit 2) with the list, record WANTED, at most once per cycle
+                (REFUSED); a second time, or above 1.3 x the window, compaction goes through and the still-pending
+                items are written to CARRY, which the SessionStart compact branch puts at the top of the new context.
+  Stop          a compaction is wanted (WANTED, or the context at notes_at()) and omissions are found: block once per
+                state of the transcript (CHECKED holds the size checked), with the list.
+  PostToolUse   a compaction is wanted: the instruction and the items the last Stop check found (CHECKED), one
+                per line; no model call here (it would stall a tool call up to reply_check's 120 s).
+  SessionStart  every source: print the plan (tools/plan.py show --compact); after a compaction also clear the
+                markers and say that the summary is not the plan. A subagent's compaction also fires SessionStart,
+                with the main session's ids and no agent_id: compacted_agent() tells it apart (the newest
+                compact_boundary is in a subagent transcript) and the agent gets AGENT_AFTER only, the main
+                session's markers untouched.
+
+When auto-compaction fires is Claude Code's call (env CLAUDE_CODE_AUTO_COMPACT_WINDOW in settings.json); a hook
+cannot start one, only hold it. Held, it is retried on the next auto-compaction check.
+"""
+import json, os, re, sys
+
+REPO = os.environ.get("CLAUDE_PROJECT_DIR", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+FLUSHED = os.path.join(REPO, ".claude", ".notes_flushed")
+WANTED = os.path.join(REPO, ".claude", ".compact_wanted")
+
+CHECKED = os.path.join(REPO, ".claude", ".compact_checked")
+REFUSED = os.path.join(REPO, ".claude", ".compact_refused")   # a PreCompact refusal happened this cycle
+CARRY = os.path.join(REPO, ".claude", ".compact_carry")       # omissions still pending when compaction was let through
+
+INSTR = ("CONTEXT GUARD: the context is near compaction. Before it, record on the plan and the ledger what it would "
+         "lose: every question you put to the user (`python3 tools/plan.py ask <entry> ...`), every decision of theirs "
+         "(they approve, hold, release, forbid, prefer or scope work: `site decide <project> --kind K --quote \"<their words>\"`, "
+         "or `plan answer`; a complaint, a correction or a question of theirs is no decision and is never recorded as "
+         "one), every 'I'll do X' you told them that is not done (a plan step: `plan add-next <entry> ...`). You (the "
+         "main session) record these yourself; the check lists what it finds missing.")
+AFTER = ("CONTEXT GUARD: this context was just compacted. The summary above is a lossy record of the CONVERSATION (what "
+         "was in flight), not of the plan: work only from the plan printed below, not from the summary's "
+         "pending list. CLAUDE.md holds (Talking to me: What you may do: never change the scope I asked for). "
+         "Re-check the running batches with `site` before acting on any number in the summary.")
+AGENT_AFTER = ("CONTEXT GUARD: your context was just compacted. The summary above is a lossy record of the "
+               "conversation: re-read your entry (`python3 tools/plan.py show <your entry>`) and the rules block of "
+               "your brief before acting, and re-check running jobs with `site` before acting on any number in the "
+               "summary. This note is for you only; the main session's bookkeeping is not yours.")
+
+
+def _boundary_at(path, tail=1 << 18):
+    """The timestamp of the last compact_boundary record in the last `tail` bytes of a transcript, '' when none."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().split(b"\n")
+    except (OSError, TypeError):
+        return ""
+    for line in reversed(lines):
+        if b'"compact_boundary"' in line:
+            try:
+                return json.loads(line).get("timestamp") or ""
+            except ValueError:
+                continue
+    return ""
+
+
+def compacted_agent(inp, now=None, within=120):
+    """The id of the subagent whose compaction fired this SessionStart, None when it is the main session's. Claude
+    Code gives a subagent's SessionStart:compact the main session's session_id and transcript_path and no agent_id
+    (the boundary is written ~0.4 s before the
+    hook runs). The agent is the one whose transcript, written in the last `within` s, holds a compact_boundary newer
+    than the main transcript's last one; a tie or nothing readable is the main session."""
+    if inp.get("agent_id"):
+        return inp["agent_id"]
+    import time
+    from datetime import datetime, timezone
+    t, sid = inp.get("transcript_path") or "", inp.get("session_id") or ""
+    if not t or not sid:
+        return None
+    sub = os.path.join(os.path.dirname(t), sid, "subagents")
+    now = time.time() if now is None else now
+    main_b = _boundary_at(t)
+    best = (main_b, None)
+    try:
+        names = os.listdir(sub)
+    except OSError:
+        return None
+    for n in names:
+        if not (n.startswith("agent-") and n.endswith(".jsonl")):
+            continue
+        p = os.path.join(sub, n)
+        try:
+            if os.path.getmtime(p) < now - within:
+                continue
+        except OSError:
+            continue
+        b = _boundary_at(p)
+        try:
+            age = now - datetime.fromisoformat(b.replace("Z", "+00:00")).timestamp() if b else None
+        except ValueError:
+            age = None
+        if age is not None and -5 <= age <= within and b > best[0]:
+            best = (b, n[len("agent-"):-len(".jsonl")])
+    return best[1]
+
+
+def plan_text():
+    """The plan itself (tools/plan.py show --compact): the only source of truth, printed so no summary stands
+    between the fresh context and it."""
+    import subprocess
+    try:
+        r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "plan.py"), "show", "--compact"],
+                           capture_output=True, text=True, timeout=60)
+        return "THE PLAN (plan/plan.yaml; launch a step agent for each entry `plan next` lists, now):\n" + r.stdout + r.stderr
+    except Exception as e:                      # noqa: BLE001
+        return "THE PLAN could not be printed (%r): run python3 tools/plan.py show now." % e
+
+
+def notes_at():
+    """Context size at which the notes are asked for: 50k below the auto-compaction window."""
+    return window_tokens() - 50000
+
+
+def context_tokens(path):
+    """The session's current context: the last assistant call's input, cache read and cache write, from the
+    transcript's tail. Unreadable: 0."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - (1 << 20)))
+            lines = f.read().split(b"\n")
+    except (OSError, TypeError):
+        return 0
+    for line in reversed(lines):
+        if b'"usage"' not in line:
+            continue
+        try:
+            u = json.loads(line)["message"]["usage"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        return (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                + u.get("cache_creation_input_tokens", 0))
+    return 0
+
+
+RECORDING = re.compile(r"plan\.py\s+(ask|answer|withdraw|unanswered|add-next|set-next|step|wait|add|describe)\b|"
+                       r"\bsite\s+decide\b")
+
+
+def window(path, lines=None):
+    """(user messages, main-session text blocks, recording commands) since the transcript's last compaction, each a
+    (time, text) list. The user's messages are reply_check's: typed prompts and mid-turn messages, no wake-ups."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import reply_check as rc
+    users, says, recs = [], [], []
+    for line in (open(path, errors="replace") if lines is None else lines):
+        if '"compact_boundary"' in line:
+            users, says, recs = [], [], []
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or r.get("isSidechain"):
+            continue
+        ts, m = r.get("timestamp", ""), r.get("message") or {}
+        if r.get("type") == "attachment" or (r.get("type") == "user" and rc.MIDTURN in line):
+            users += [(ts, p) for p in rc.midturn(r)]
+        elif r.get("type") == "user" and not (r.get("isMeta") or r.get("isCompactSummary")) \
+                and r.get("toolUseResult") is None:
+            for t in rc.texts(m.get("content")):
+                t = t.strip()
+                if t and not t.startswith(rc.SKIP) and '"tool_result"' not in line:
+                    users.append((ts, t))
+        elif r.get("type") == "assistant" and isinstance(m.get("content"), list):
+            for x in m["content"]:
+                if not isinstance(x, dict):
+                    continue
+                if x.get("type") == "text" and x.get("text", "").strip():
+                    says.append((ts, x["text"].strip()))
+                elif x.get("type") == "tool_use" and x.get("name") == "Bash":
+                    cmd = (x.get("input") or {}).get("command") or ""
+                    if RECORDING.search(cmd):
+                        recs.append((ts, cmd[:600]))
+                elif x.get("type") == "tool_use" and x.get("name") in ("SendMessage", "Agent"):
+                    i = x.get("input") or {}      # work handed to an agent is recorded with its owner
+                    recs.append((ts, "%s to %s: %s" % (x["name"], i.get("to") or i.get("description") or "",
+                                                       str(i.get("message") or i.get("prompt") or "")[:600])))
+    return users, says, recs
+
+
+def check_prompt(users, says, recs, budget=150000, steps=None):
+    """The model's brief: the plan's entries and steps, then the window, oldest first, as one time-ordered log cut
+    from the front to `budget` chars."""
+    steps = plan_text() if steps is None else steps
+    log = sorted([(t, "USER", x) for t, x in users] + [(t, "ASSISTANT", x) for t, x in says] +
+                 [(t, "RECORDED", x) for t, x in recs])
+    body = "\n\n".join("[%s %s]\n%s" % (t[:16], who, x[:4000]) for t, who, x in log)
+    body = body[-budget:]
+    return f"""You check the bookkeeping of an assistant before its context is compacted (what is not recorded is
+lost). The log below is its conversation with the researcher since the last compaction, oldest first:
+USER is the researcher's message, ASSISTANT a message the assistant wrote to them, RECORDED a command the assistant ran that
+records something (`plan.py ask` records a question put to the user; `site decide` or `plan.py answer` records their
+answer or decision in their words; `plan.py add-next|set-next|step|wait|add` records a step of work; a SendMessage or
+Agent call hands work to an agent that owns it). The plan's entries and their next steps, as they stand now:
+<<<
+{steps[:20000]}
+>>>
+
+Answer ONLY with JSON: {{"questions": [...], "answers": [...], "commitments": [...]}}, each item
+{{"quote": "<copied word for word from the log>", "why": "<one short sentence>"}}. List:
+- questions: a question the ASSISTANT put to the user that needs their answer (a decision only they can make), that no
+  later RECORDED `plan.py ask`/`answer`/`withdraw` records and that they did not answer later in the log in a way
+  RECORDED by `site decide` or `plan.py answer`. Rhetorical questions, questions answered in the same message, and
+  "should I go on?" courtesy questions do not count.
+- answers: a message of USER that answers a question or decides how work goes (approves, refuses, scopes,
+  prefers, forbids), for which no later RECORDED `site decide` or `plan.py answer` carries their words. Questions of
+  theirs, complaints ("why are you doing it yourself?", "I didn't ask you to ..."), corrections of the assistant and
+  remarks that decide nothing do not count, even when they say what should have been done.
+- commitments: an ASSISTANT sentence to the user promising work not done in the same message ("I'll run X", "next I
+  will ...", "X comes next"), that no later ASSISTANT message reports done and no RECORDED plan step covers.
+  Work that finished later in the log does not count.
+Quote exactly (the quote is searched for in the log). When nothing is missing, answer with three empty lists.
+
+<<<
+{body}
+>>>
+"""
+
+
+def items_of(v, users, says):
+    """[(kind, quote, why)] of the model's answer whose quote is in the window (questions and commitments in the
+    assistant's text, answers in the user's): a quote the window does not hold is dropped."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import reply_check as rc
+    pool = {"questions": rc.norm("\n".join(x for _, x in says)), "commitments": rc.norm("\n".join(x for _, x in says)),
+            "answers": rc.norm("\n".join(x for _, x in users))}
+    out = []
+    for kind in ("questions", "answers", "commitments"):
+        for it in (v.get(kind) or []) if isinstance(v, dict) else []:
+            q = str((it or {}).get("quote", "")).strip() if isinstance(it, dict) else ""
+            if len(q) >= 8 and rc.norm(q) in pool[kind]:
+                out.append((kind, q, str(it.get("why", "")).strip()))
+    return out
+
+
+def pending(path, ask=None, steps=None):
+    """The omissions of the window as refusal lines; [] when none, or when the check cannot run (it never stalls)."""
+    try:
+        users, says, recs = window(path)
+        if not users and not says:
+            return []
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import reply_check as rc
+        v = (ask or rc.ask_model)(check_prompt(users, says, recs, steps=steps))
+        if v is None:
+            return []
+        how = {"questions": "a question to the user with no `plan ask`", "answers": "a decision of the user's "
+               "(approve, hold, release, forbid, prefer, scope; never a complaint) with no `site decide`", "commitments": "a commitment with no plan step"}
+        return ["%s: \"%s\" (%s)" % (how[k], q[:300], w) for k, q, w in items_of(v, users, says)]
+    except Exception:                   # noqa: BLE001
+        return []
+
+
+def stop_items(inp, ask=None, repo=REPO, steps=None, notes=None):
+    """Stop: the refusal lines, once per state of the transcript (its size), while a compaction is wanted. At most
+    one refusal per wanted period (until the markers are cleared at compaction); later omissions go to `notes` only (a model rewording
+    its quotes would make the same omission look new on every Stop)."""
+    path = inp.get("transcript_path")
+    if inp.get("agent_id") or not path or not os.path.exists(path):
+        return []
+    wanted, checked = (os.path.join(repo, ".claude", x) for x in (".compact_wanted", ".compact_checked"))
+    if not os.path.exists(wanted) and context_tokens(path) < notes_at():
+        return []
+    open(wanted, "w").close()
+    size = os.path.getsize(path)
+    try:
+        last = json.load(open(checked))
+    except (OSError, ValueError):
+        last = {}
+    if last.get("size") == size:
+        return []                       # this state was checked: never block twice on it
+    got = pending(path, ask, steps)
+    refused = list(last.get("refused") or [])
+    new = [] if refused else got        # one refusal per wanted period: the model rewords its quotes, so keys never match
+    json.dump({"size": size, "items": got, "refused": refused + ["refused"] * bool(new)}, open(checked, "w"))
+    if got and not new and notes is not None:
+        notes.append("context guard: refused once already this period, still open: " + "; ".join(got))
+    return [INSTR + "\n" + "\n".join("  - " + g for g in got)] if new else []
+
+
+def window_tokens():
+    try:
+        return int(os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") or 400000)
+    except ValueError:
+        return 400000
+
+
+def checked_dict():
+    try:
+        return json.load(open(CHECKED))
+    except (OSError, ValueError):
+        return {}
+
+
+def checked_items():
+    """The omissions the last Stop check found (stop_items writes them to CHECKED)."""
+    try:
+        return json.load(open(CHECKED)).get("items") or []
+    except (OSError, ValueError):
+        return []
+
+
+def _clear(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def main():
+    try:
+        inp = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    ev = inp.get("hook_event_name", "")
+    if ev == "PreCompact":
+        if inp.get("trigger") != "auto" or inp.get("agent_id"):
+            return 0
+        open(WANTED, "w").close()
+        got = pending(inp.get("transcript_path"))
+        if not got:
+            return 0
+        try:                                  # PostToolUse only reads this list (no model call on its hot path)
+            json.dump({**checked_dict(), "items": got}, open(CHECKED, "w"))
+        except OSError:
+            pass
+        # the 1.3x bound: a stuck refusal can never let the context pass ~650k at a 500k window
+        if os.path.exists(REFUSED) or context_tokens(inp.get("transcript_path")) > 1.3 * window_tokens():
+            open(CARRY, "w").write("\n".join("  - " + g for g in got) + "\n")   # let it through; nothing is lost
+            return 0
+        open(REFUSED, "w").close()
+        sys.stderr.write(INSTR + "\n" + "\n".join("  - " + g for g in got) + "\n")
+        return 2
+    if ev == "SessionStart":
+        if inp.get("source") == "compact" and compacted_agent(inp):
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": AGENT_AFTER}}))
+            return 0
+        ctx = plan_text()                     # every source (startup, resume, clear, compact) starts from the plan
+        if inp.get("source") in ("startup", "clear"):
+            for p in (REFUSED, CARRY):        # a new session's first auto compaction gets its one refusal
+                _clear(p)
+        if inp.get("source") == "compact":
+            carried = ""
+            try:
+                carried = open(CARRY).read()
+            except OSError:
+                pass
+            for p in (FLUSHED, WANTED, CHECKED, REFUSED, CARRY):
+                _clear(p)
+            ctx = AFTER + "\n\n" + ctx
+            if carried:
+                ctx = ("CONTEXT GUARD: omissions still unrecorded when the compaction went through (record them: "
+                       "`plan ask`, `site decide`, `plan add-next`):\n" + carried + "\n" + ctx)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+        return 0
+    if ev == "Stop":
+        if inp.get("stop_hook_active"):
+            return 0
+        got = stop_items(inp)
+        if got:
+            print(json.dumps({"decision": "block", "reason": got[0]}))
+    elif ev == "PostToolUse" and not inp.get("agent_id"):
+        if os.path.exists(WANTED) or context_tokens(inp.get("transcript_path")) >= notes_at():
+            open(WANTED, "w").close()
+            got = checked_items()
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext":
+                              INSTR + ("\nPending now:\n" + "\n".join("  - " + g for g in got) if got else "")}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

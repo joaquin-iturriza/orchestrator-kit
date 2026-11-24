@@ -1,0 +1,19 @@
+paths: .claude/agents/**, .claude/.review_state/**
+cmds: review_backlog\.sh, /review-now, \bgit\s+merge\b
+---
+- Pillars: `CLAUDE.md`, `~/work/CLAUDE.md`, `.claude/context/**`, `plan/*prompt*.txt` and `.claude/agents/**` ->
+  claudemd-keeper (which also reads the hooks' refusal texts); source -> repo-reviewer (`*.py`, `*.sh`, `tools`,
+  `tests`, `scripts`, `.claude/settings.json`). Not counted: plan bookkeeping (`plan/**` but its prompt templates), data
+  files (`*.json`, `*.log`, `*.out`, `*.err`), `runs/`, `sweeps/`. The table is PILLARS in
+  `.claude/hooks/review_backlog.sh`.
+- A backlog is everything since its pillar's watermark. Thresholds: any change for the CLAUDE.md pillar; 520 changed
+  lines for code. Past its threshold, edits to the pillar's files and commits carrying its uncommitted changes are
+  refused until its reviewer runs.
+- Whatever the threshold, a merge into `trunk` and `plan done` need the commits merged or closed to sit inside a
+  passed backlog.
+- One reviewer per backlog: a launch while that pillar's reviewer holds its lock is refused and names the agent to
+  continue with SendMessage. A blocking review keeps its lock so its fixes can be applied; the re-check continues the
+  same reviewer, naming the fix commits. A lock expires after 180 min.
+- `review_backlog.sh status` lists backlogs; `begin <name>` and `advance <name>` are the reviewer's own (the user's
+  override is a `!` command). Watermarks: `.claude/.review_state/`.
+- The reviewers (claudemd-keeper, repo-reviewer, design-reviewer) inherit the main session's model.

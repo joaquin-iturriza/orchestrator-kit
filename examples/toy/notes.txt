@@ -1,0 +1,4 @@
+Results of the toy project. A finished plan entry is written up here under a \label{...} line that `plan ref` names.
+
+\label{sec:toy-fit}
+(empty until the first entry is done)

@@ -1,0 +1,25 @@
+on: write
+paths: .claude/hooks/**, .claude/settings*.json, ~/.claude/hooks/**, ~/.claude/settings.json
+cmds: \bhook_incident\.py\b
+---
+- A hook refuses the end of a turn only for an omission the turn itself can clear; what waits on an agent, a job, a
+  cluster or the user is a note in its output.
+- Every registered hook runs through `.claude/hooks/dispatch.py <hook>`: it skips a hook listed in
+  `.claude/hooks/disabled.json`; it detects a loop (the same refusal twice with nothing changed in between), then
+  disables that hook, opens an incident and lets the call through.
+- Incidents: `tools/hook_incident.py <hook> --why "<why>"` disables a hook that refuses wrongly, appends to
+  `.claude/hooks/incidents.jsonl` and opens an ALERT; `--replay <id>` tests a fix on the recorded refusal before
+  `--resolve <hook>` re-enables it.
+- The set. Stop and SubagentStop: `plan_check.py`, the single gate (plan and owners, events, supervisor and waiter,
+  questions sent, context flush, reply answers; a condition the project does not want goes in projects.toml
+  `policy.checks_off` as `plan_check.py:<condition>`), and `auto_push.sh` (pushes trunk, never refuses). PreToolUse:
+  `submit_guard.py` (placement, design, GPU budget, wall-time target, deleting data on a site by hand),
+  `review_guard.py` (one reviewer per backlog), `brief_guard.py` (owner briefs carry the rules block),
+  `plan_files_guard.py` (plan files change only through tools/plan.py), `review_backlog.sh gate|bashpre`,
+  `hook_syntax_guard.py`, `no_blocking_question.sh`, `wait_guard.py` (no waiting on jobs). PostToolUse:
+  `review_guard.py`, `owner_context.py`, `owner_handoff.py` (an owner's context at the close threshold),
+  `delegation_note.py` (a note when the main session does an entry's work itself), `context_push.py`,
+  `context_guard.py`, `hook_syntax_guard.py`. UserPromptSubmit: `notification_absorb.py`. PostToolUseFailure:
+  `submit_guard.py refund`. SessionStart: `context_guard.py`, `context_push.py`. PreCompact: `context_guard.py`.
+- Python hooks exit 1 on a crash (non-blocking); every hook is parsed before a write and restored from the last good
+  copy after a broken one.

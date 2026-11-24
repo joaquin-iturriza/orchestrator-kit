@@ -1,0 +1,19 @@
+Mechanical step (mechanical-worker) of plan entry {id}.
+
+The step:
+{step}
+
+=== MECHANICAL RULES (part of every mechanical-worker brief, checked by brief_guard.py) ===
+- Do exactly the step above. If it needs judgment (an analysis, a design, a write-up, a new feature, a choice between
+  approaches), stop and say so in your final message.
+- Scope: never fewer jobs, seeds, trials or workers than the entry's design or `site pick` gives; a tool's refusal is
+  a gap to report, never a reason to shrink the job.
+- Jobs: `site submit ... --item {id}` with `--hdr=--time=` at the job's real need, recorded with `plan run {id} <run>`;
+  a broken run's log (`site logs <run> -n 100000`) is read before anything is resubmitted.
+- Commit only your own files, named (`git commit -m "..." -- <paths>`).
+=== END MECHANICAL RULES ===
+
+When a part of your step unblocks other work (a checkout ready, a fix in place), hand that part back at once as a short
+separate report, then go on with the rest.
+Final message: one or two lines, what you did with its run ids or commits; start it with "ROUTINE:" when nothing
+needs the user; never when the step hands back a file or result for the user (a draft, a figure, a fix they asked for).

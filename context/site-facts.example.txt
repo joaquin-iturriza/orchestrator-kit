@@ -1,0 +1,14 @@
+paths: sites/**, ~/.config/ccorch/sites.toml
+cmds: \bsite\s+\S+\s+(ccin2p3|jeanzay|lxplus)\b, \b(sbatch|scontrol|squeue|condor_\w+)\b
+---
+- CC-IN2P3: `--gpus=N` (typed `--gres` breaks its Lua plugin), `--mem` mandatory, 5 CPUs per V100 max. Compute nodes
+  have internet. It prints a login notice before every command's output; `site` strips it (`strip_banner`: each remote
+  command starts with a marker and what precedes it is dropped, plus the notice's frame anywhere; `site sync` sends a
+  bundle, as git's ssh protocol breaks on it). A parser reading raw ssh output from its first line breaks on it (it
+  once routed GPU jobs to the CPU partition: "Requested node configuration is not available").
+- Jean Zay: no `--qos`, no `--mem`; compute nodes have NO internet (stage data first); inode quota nearly full (no new
+  conda/venv with its own torch).
+- lxplus: HTCondor submits only from AFS (`SUBMIT_DIR`), code and data on EOS; 2FA: the ssh master is opened by the
+  user (`ssh -fN lxplus`). `site` runs `kinit -R; aklog` before every command there so /afs stays writable. If
+  verify still says "AFS token?", the ticket's renew window ended and only the user can relogin
+  (`ssh -O exit lxplus && ssh -fN lxplus`); never ask for it while `kinit -R` still works.

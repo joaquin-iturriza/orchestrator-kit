@@ -1,0 +1,47 @@
+paths: ~/.config/ccorch/**, ~/.local/share/ccorch/**
+cmds: (^|[;&|]\s*)site\s
+---
+```
+site list                          sites and whether they are up
+site pick <project> [--jobs N --groups G --mem M]   where a job or a batch should go, per-site finish times
+site copy <project> <src> <dst> <paths...> [--to D --overwrite]   data between two sites (site to site, never via the local machine)
+site env <site> <project>          make the project runnable there: checkout + Python env +
+                                   sites/setup.sh (MadGraph, staged datasets, caches...), idempotent.
+                                   `site pick` treats a site as deployed only if
+                                   `sites/setup.sh --verify` passes there.
+site sync <site> <project>         push local commits, fast-forward the site checkout
+site submit <site|auto> <project> <job.sh> --item ITEM [--est-gpu-hours H] [--note ..]
+site run <site> <project> -- <cmd>   one command on the site's login node, in the checkout,
+                                   env activated: sweep generators, submitters, queue queries,
+                                   reads under a minute (CC: other scripts refused, the rest cut
+                                   at 60 s; sites.toml login_cap, projects.toml login_scripts).
+site run --job [--timeout S] <site> <project> -- <cmd>   the same as a CPU job (Slurm sites; the
+                                   project's sites.yaml cpu block; time limit --timeout, default
+                                   120 s): a call reads the
+                                   last job's output once (its exit code), else submits; exit 75
+                                   = nothing to read yet. --recurring also submits the next run
+                                   on a read (the supervisor's maintain commands).
+site poll [run ...]                refresh states from the schedulers
+site logs <run>                    tail the job's log
+site fetch <run>                   pull tier-0 results (metrics, small plots, configs) home
+site where <run>                   where a run's outputs live (local mirror + remote path)
+site runs [--project P] [--site S] the registry (~/.local/share/ccorch/runs.db)
+site status <site>                 queue view
+```
+
+`site pick` plans a batch so it finishes earliest: per site it measures free GPUs this request fits (host memory,
+CPUs), your running and queued jobs, the per-user submit cap, everyone else pending, and what your jobs there really
+waited and ran, and prints per site "N sweeps, done in ~X h". A sweep's trials share one filesystem, so a group never
+splits. Each named submission (`site submit <site>`, `site run ... sweep_manager.py submit`) spends one unit of the plan
+for 60 min. `site pick` treats a site as deployed only if `sites/setup.sh --verify` passes there.
+
+`site submit --hdr=--time=HH:MM:SS` overrides the script's time limit (passed to `sbatch` as a flag).
+
+Inside a job, `source "$_CCORCH_ROOT/sites/activate.sh"` resolves the site and exports `PROJECT_DIR`, `DATA_DIR`,
+`SCRATCH`, `SUBMIT_DIR`; Python uses `siteconf` (`siteconf.PROJECT_DIR`, `siteconf.slurm_header(...)`,
+`siteconf.resolve(cfg)`). Site-owned directives come from `sites/sites.yaml` + `~/.config/ccorch/sites.toml`.
+
+Where results are: `site fetch` mirrors tier-0 (metrics, summary, config, small plots) to
+`~/.local/share/ccorch/artifacts/<project>/<run>/`. Heavy artefacts stay on the site; `site where <run>` prints both
+locations. The registry (`~/.local/share/ccorch/runs.db`) records the deployed commit of every run, so a result can
+always be tied to code.

@@ -1,0 +1,53 @@
+paths: ~/.local/share/ccorch/runs.db
+cmds: \bsite\s+(decide|undecide|decisions|item|items|supervise|events|ack|digest)\b
+---
+Enforced where `~/.config/ccorch/projects.toml` has `ledger = true`.
+
+```
+site decide <project> --kind approve|hold|release|forbid|prefer|scope --quote "<the user's exact words>" --covers ...
+          [--supersedes D<n>,...]   the old decisions stop being in force (`site decisions --all` still lists them)
+site undecide <project> D<n>[,D<m>...] --quote "<the user's words asking for it>"   marks them deleted (kept under `--all`)
+site decisions [--project P] [--all]   the calls in force; also printed into every new or compacted session
+site item add <project> <id> --decision D<n> --scope "what runs, how many, how long" --match 'glob,...'
+          [--check "<cmd printing {units:{name:{expected,done,active}},alerts:[]}>"] [--notes docs/results.tex]
+site item set|done <project> <id> [--est-gpu-hours H --waiting "<what it waits on>" ...]
+site items [-v]                    active and held work, with progress
+site supervise --project P         the background supervisor (below)
+site events [--wait]               open events; `--wait` is the waiter that wakes the main session on the next one
+site ack E<n> --note "what was done" [--needs-user WHAT]
+site digest --project P            since the user last looked: calls for them, findings, routine handling as
+                                   counts, item progress, whether the watch is alive
+```
+
+- Only a decision is recorded: the user approves, holds, releases, forbids, prefers or scopes work; a complaint, a
+  correction or a question of theirs is none. `site decide` and `site undecide` search the transcripts (mid-turn
+  messages and slash-command arguments included) and refuse a quote the user never typed; a hold or release prints
+  the items it covers.
+- New work: the user's words, `site decide`, `site item add`, then submit. On the site, sbatch and condor_submit refuse
+  without an item; a project's own submitters (`siteconf.work_gate`) refuse anything outside the named items'
+  globs or inside a held one.
+- The GPU budget lives in the same site-side gate, so every GPU job counts whatever submits it (`site submit`, launch
+  scripts, sweep_manager, generators): wall time × GPUs × jobs, summed over the named items' jobs of the last 60 min
+  on every site, is refused above the project's budget (its CLAUDE.md) unless the item's recorded estimate (`site item set
+  --est-gpu-hours`, from the user's words) covers it. The local machine's submit_guard is the early warning.
+
+The supervisor does the mechanical work, with no model, every 20 min:
+- runs the project's `maintain` commands (projects.toml), each active
+  item's check (`site item add --check`), and the overrun check of queued runs (with the scheduler's reason);
+- sorts every run end into one of three:
+  finished clean: COMPLETED, its end marker in the log, no error pattern;
+  hit its planned limit: TIMEOUT of a worker whose queue still has tasks and whose wall limit is the one its queue
+  states (the worker ends by design and the queue continues);
+  broke: anything else (FAILED, OUT_OF_MEMORY, NODE_FAIL, a TIMEOUT that was not a planned limit, an error pattern).
+  It acks the first two itself, the note naming the run, its class and the log line that decided it, and opens the
+  third as an event for the agent that owns the work;
+- resubmits workers only for queues the user approved (the item's decision names the queue and its limits: workers,
+  wall time per worker, total hours), within those limits, and only while the queue's layout is current (its spec
+  hash equals the recipes' and no replan is pending); otherwise it raises an ALERT;
+- collects finished runs (`plan collection`, when the entry records one) when nothing is off; anything off is an event for the owner;
+- never resubmits a failed task;
+- raises an ALERT when a batch's progress predicts its end beyond 2× its recorded wall-time target.
+
+Events that reach an agent: RUN (a run that broke), GAP (expected results missing with nothing queued to produce
+them), OVERRUN, ALERT, READY (a comparison became possible: analyse it, write it up in the item's notes, commit, show
+the user, then ack; it closes only once its write-up is committed). `--needs-user` marks a call only the user can make.

@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit: absorb the second wake of an agent end.
+
+Each background subagent's end gives the main session two signals: its SubagentHandback message (the report) and the
+harness's <task-notification> "Agent ... finished", whose <result> says the report "was delivered to you as a message
+from <id> (its SubagentHandback call)". Mid-turn the notification is folded into the running turn at no cost; when it
+arrives after the turn ended it starts a turn of its own, and the model is
+called on it at the full context.
+
+This hook blocks that prompt, so no model call is made on it, only when all hold:
+  - the prompt is a <task-notification> whose task id is an agent id (a + 16 hex) and whose status is completed;
+  - its result says the report was delivered through SubagentHandback (nothing in it is new);
+  - the prompt is that one notification and nothing else (no second notification, no reminder after it);
+  - the transcript holds a hand-back message from that same agent (the report did reach this session).
+It also blocks a completed agent notification whose result says the agent "has not reported yet: it is waiting on its
+own background work" (nothing new; its report comes later through SubagentHandback).
+Anything else (a notification with the report inline, a failed or killed agent,
+a background command, typed text) passes untouched. A crash exits 1 (non-blocking: the prompt goes through).
+
+Hand-back batching: a prompt that is one agent's hand-back
+and nothing else, arriving in the main session (no agent_id) while its events waiter (`site events --wait`, pid file
+~/.local/share/ccorch/events_waiter.<project>.pid) is alive, is written to ~/.local/share/ccorch/spool/<project>/ and opened as a
+routine HANDBACK event (`site event`); the prompt is blocked. The waiter collects routine events for a fixed
+--debounce window (600 s) from the first, then prints each spooled report in full and acks it: hand-backs, run ends and
+other routine events of one 10-minute window wake the main session once. No waiter alive, a failed `site event`, a
+prompt holding anything else (typed text, a second message): the prompt goes through untouched.
+    python3 notification_absorb.py            (hook input on stdin)
+    python3 notification_absorb.py --check <transcript.jsonl> <prompt file>    the verdict, for tests and replays
+"""
+import hashlib, json, os, re, subprocess, sys, time
+
+AGENT = re.compile(r"<task-id>(a[0-9a-f]{16})</task-id>")
+WAITING = re.compile(r"<result>This agent has not reported yet: it is waiting on its own background work")
+DELIVERED = re.compile(r"report was delivered to you as a message from \"?(a[0-9a-f]{16})\"? \(its SubagentHandback call\)")
+
+
+SPOOL_FRESH_S = 900
+
+
+def handed_back(transcript, agent):
+    """True when the transcript holds a hand-back message from `agent` (a queued message or a turn-starting one), or
+    the hand-back was spooled for the batch (a spooled report never reaches the transcript, so the agent's
+    'finished' notification after it would otherwise wake the main session on its own)."""
+    import glob, time
+    # only a report spooled by this run: an owner resumed many times under one id keeps its older spool files, and a
+    # later run that ends with no hand-back must still wake the main session; the notice
+    # follows its hand-back within seconds (median 0.17 s, at most ~1 min)
+    if any(time.time() - os.path.getmtime(f) < SPOOL_FRESH_S
+           for f in glob.glob(os.path.join(CCORCH, "spool", PROJECT, "*_%s_*.txt" % agent))):
+        return True
+    tag = 'agent-message from=\\"%s\\"' % agent      # as written inside a JSON string
+    tag_plain = 'agent-message from="%s"' % agent
+    try:
+        with open(transcript, errors="replace") as f:
+            for line in f:
+                if (tag in line or tag_plain in line) and "Subagent hand-back" in line:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def verdict(prompt, transcript):
+    """(block, why) for one prompt."""
+    s = prompt or ""
+    i = s.find("<task-notification>")
+    if i < 0 or i > 1500:          # the harness's notification preamble may come first, nothing else
+        return False, "not a task-notification"
+    s = s[i:]
+    end = s.find("</task-notification>")
+    if end < 0 or s.count("<task-notification>") != 1 or s[end + len("</task-notification>"):].strip():
+        return False, "more than one notification, or text after it"      # anything else in it may be new
+    s = s[:end]
+    m = AGENT.search(s[:300])
+    if not m:
+        return False, "not an agent's notification"
+    agent = m.group(1)
+    if "<status>completed</status>" not in s:
+        return False, "status is not completed"
+    if WAITING.search(s):
+        # nothing to act on: the agent resumes on its own work and hands back later
+        return True, agent
+    d = DELIVERED.search(s)
+    if not d or d.group(1) != agent:
+        return False, "the result is not a SubagentHandback delivery"
+    if not transcript or not handed_back(transcript, agent):
+        return False, "no hand-back from %s in the transcript" % agent
+    return True, agent
+
+
+# the hook receives the bare `<agent-message ...>`; the transcript records it with the
+# harness's "Another Claude session sent a message:" line before it: both match
+# any one agent's message is batched, its final hand-back or a mid-run SendMessage
+HANDBACK = re.compile(r'\A(?:Another Claude session sent a message:\s*)?<agent-message from="(a[0-9a-f]{16})">')
+GRACE_S = 900   # a waiter that returned this recently is being re-armed by the main session: keep spooling
+TRAILER = 'That "other Claude session" is an agent working inside this same session'
+CCORCH = os.path.expanduser(os.environ.get("NOTIFY_CCORCH_HOME", "~/.local/share/ccorch"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools"))
+import plan  # noqa: E402
+PROJECT = plan.PROJECT
+SITE_BIN = os.path.expanduser(os.environ.get("NOTIFY_SITE_BIN", "~/.local/bin/site"))
+
+
+def proc_start(pid):
+    """(clock ticks since boot as written in /proc/<pid>/stat field 22, start as epoch seconds) or None."""
+    try:
+        ticks = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[19]
+        btime = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime "))
+        return ticks, btime + int(ticks) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError, StopIteration):
+        return None
+
+
+def waiter_alive(project=PROJECT):
+    """A live waiter, or one that returned less than GRACE_S ago (between a waiter's return and the main session's
+    re-arm nothing would be absorbed). The Stop hook makes the main session re-arm, and the new waiter
+    delivers the open HANDBACK events."""
+    try:
+        if time.time() - float(open(os.path.join(CCORCH, "events_waiter.%s.returned" % project)).read().split()[0]) \
+                < GRACE_S:
+            return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return _waiter_live(project)
+
+
+def _waiter_live(project=PROJECT):
+    """The project's events waiter is alive: its pid file names a live `site events --wait` process whose start ticks
+    match the ones it recorded (a reused pid does not pass). Liveness only: the earlier test that it started after
+    `site` last changed went false at every edit of `site` until the waiter was re-armed."""
+    try:
+        f = open(os.path.join(CCORCH, "events_waiter.%s.pid" % project)).read().split()
+        pid = int(f[0])
+        cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(errors="replace")
+    except (OSError, ValueError, IndexError):
+        return False
+    st = proc_start(pid)
+    if not ("events" in cmd and "--wait" in cmd) or not st or (len(f) > 1 and f[1] != st[0]):
+        return False
+    return True
+
+
+def handback_of(prompt):
+    """The agent id when the prompt is exactly one hand-back (and the harness's standard note after it), else None."""
+    s = (prompt or "").strip()
+    m = HANDBACK.match(s)
+    if not m or s.count("<agent-message") != 1:
+        return None
+    end = s.find("</agent-message>")
+    if end < 0:
+        return None
+    rest = s[end + len("</agent-message>"):].strip()
+    if rest and not rest.startswith(TRAILER):
+        return None
+    if rest.count("<") or rest.count("[") or "\n\n" in rest:     # anything after the standard note may be new
+        return None
+    return m.group(1)
+
+
+def mid_turn(transcript):
+    """True when the session's last assistant message called a tool (its turn is running): a hand-back then folds into
+    that turn at no extra call, while a spooled one forces a Stop-hook continuation on its open HANDBACK event."""
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 400000))
+            lines = f.read().decode(errors="replace").splitlines()
+    except (OSError, TypeError):
+        return False
+    for line in reversed(lines):
+        if '"type":"assistant"' not in line.replace(" ", ""):
+            continue
+        try:
+            m = json.loads(line).get("message") or {}
+        except ValueError:
+            continue
+        return m.get("stop_reason") == "tool_use"
+    return False
+
+
+def spool(prompt, agent, site=("site",)):
+    """(ok, event line): the report written to the spool and opened as a HANDBACK event."""
+    d = os.path.join(CCORCH, "spool", PROJECT)
+    os.makedirs(d, exist_ok=True)
+    h = hashlib.sha1(prompt.encode()).hexdigest()[:10]
+    path = os.path.join(d, "%d_%s_%s.txt" % (time.time(), agent, h))
+    with open(path, "w") as f:
+        f.write(prompt)
+    body = re.sub(r"\A[^>]*<agent-message[^>]*>", "", prompt.split("The report follows:", 1)[-1].strip()).strip().splitlines()
+    first = " ".join((body[0] if body else "").split())[:160]
+    # a ROUTINE: hand-back never reaches the user: opened already acked, so it neither wakes the waiter nor needs an ack
+    routine = ["--acked-note", "routine hand-back, auto-acked"] if first.startswith("ROUTINE:") else []
+    r = subprocess.run(list(site) + ["event", "--project", PROJECT, "--kind", "HANDBACK", "--key",
+                                     "handback:%s:%s" % (agent, h), "--msg",
+                                     "hand-back from %s: %s | report: %s" % (agent, first, path)] + routine,
+                       capture_output=True, text=True, timeout=60)
+    ok = r.returncode == 0 and re.search(r"\bE\d+\b", r.stdout or "")
+    return bool(ok), (r.stdout or r.stderr or "").strip()[-200:]
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--check":
+        with open(sys.argv[3]) as f:
+            print(json.dumps(dict(zip(("block", "why"), verdict(f.read(), sys.argv[2])))))
+        return 0
+    d = json.load(sys.stdin)
+    if d.get("hook_event_name", "UserPromptSubmit") != "UserPromptSubmit":
+        return 0
+    prompt = str(d.get("prompt") or "")
+    agent = None if d.get("agent_id") else handback_of(prompt)
+    if agent:
+        # one line per hand-back says which condition held, so a hand-back not spooled shows why
+        try:
+            with open(os.path.join(CCORCH, "absorb.log"), "a") as f:
+                f.write("%s %s waiter_alive=%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), agent,
+                                                     waiter_alive()))
+        except OSError:
+            pass
+    elif not d.get("agent_id") and "<agent-message" in prompt[:400]:
+        try:
+            with open(os.path.join(CCORCH, "absorb.log"), "a") as f:
+                f.write("%s not-one-handback %r\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), prompt[:120]))
+        except OSError:
+            pass
+    if agent and waiter_alive() and not mid_turn(d.get("transcript_path")):
+        ok, line = spool(prompt, agent)
+        if ok:
+            print(json.dumps({"decision": "block", "reason": "hand-back of %s spooled for the 10-minute batch (%s); "
+                              "the events waiter delivers it" % (agent, line)}))
+            return 0
+    block, why = verdict(prompt, d.get("transcript_path"))
+    if block:
+        print(json.dumps({"decision": "block",
+                          "reason": ("agent %s is waiting on its own work; its report comes later" if WAITING.search(prompt)
+                                     else "agent %s finished; its report was already delivered by its hand-back") % why}))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:      # never block on a crash
+        print("notification_absorb.py: %s" % e, file=sys.stderr)
+        sys.exit(1)

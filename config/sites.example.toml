@@ -1,0 +1,58 @@
+# ~/.config/ccorch/sites.toml -- the places with GPUs. Copied here by install.sh; replace every <...>.
+#
+# Design rule: the working copy is LOCAL. Code reaches a site by git (`site sync`), never by a mount. Only scheduler
+# traffic crosses the wire (submit, poll, fetch), so a site is reachable or not, never half-mounted, and nothing of
+# the agent runs on cluster hardware.
+#
+# Every site needs a host alias in ~/.ssh/config (`ssh = ...` below) with key authentication and, ideally, a
+# ControlMaster so repeated calls reuse one connection.
+
+[defaults]
+sync = "git"                 # push local -> fast-forward on the site; never rsync a tree
+poll_interval = 45
+relay = "<an ssh alias of an always-on host that can reach every site>"   # `site copy` runs site to site there
+
+# ------------------------------------------------------------------ a Slurm site
+[sites.myslurm]
+ssh          = "<ssh alias, from ~/.ssh/config>"
+root         = "<your storage root there>"            # projects are checked out under it
+scheduler    = "slurm"
+submit       = "sbatch --parsable"
+account      = "<your allocation>"
+partition    = "<gpu partition(s), comma separated>"
+gpu_flag     = "--gres=gpu:{n}"     # what this site's scheduler reads; some want "--gpus={n}"
+# qos        = "<qos>"              # only where the site requires one
+# mem        = "32G"                # only where the site rejects jobs without --mem
+# max_cpus_per_gpu = 5              # a hard per-GPU CPU cap enforced at submit
+# pip_cache  = "<root>/tmp/pip-cache"   # `site env` uses it
+interactive  = "srun --partition=<gpu partition> --account=<allocation> --gres=gpu:1 --pty bash -l"
+budget       = "soft"               # "scarce": hours limited; `site pick` skips it unless --allow-scarce, and the
+                                    # GPU budget's lower cap (projects.toml policy.gpu_cap_scarce_h) applies
+compute_net  = true                 # compute nodes have internet (false: stage data first)
+# login_cap  = 60                   # seconds a `site run` read may take on its login nodes (sites that forbid
+                                    # scripts there); longer work goes through `site run --job`
+# login_shell = true                # non-login shells lack PATH or outbound HTTPS here
+# env        = { NODE_OPTIONS = "--max-old-space-size=2048" }   # variables for every command there
+# hop_kex    = "<kex list>"         # for hops from the relay when the default key exchange stalls
+# hop_mss    = 1200                 # clamp TCP segments on relay hops when large packets are dropped
+# aliases    = ["<other names the agent may use for this site in prose>"]
+# Login-banner stripping: sites that print a notice before every command are handled by `site` (strip_banner).
+notes = """
+Free text the agents read with `site list`: GPU models, quirks, what is untested.
+"""
+
+# ------------------------------------------------------------------ an HTCondor site
+[sites.mycondor]
+ssh          = "<ssh alias>"
+# ssh_gpu    = "<ssh alias of an interactive GPU login>"
+root         = "<code and data root>"
+submit_root  = "<root the schedd can read; HTCondor may refuse some filesystems>"
+scheduler    = "condor"
+submit       = "condor_submit"
+flavour      = "tomorrow"           # a default only: a job gets the shortest flavour covering its --time
+budget       = "soft"
+compute_net  = true
+# two_factor = true                 # the ssh master is opened by the user; `site` never prompts
+# agent_sock = "/tmp/<you>-agent.sock"   # ssh agent forwarded over the master so this site can start copies
+# preamble   = "kinit -R >/dev/null 2>&1; aklog >/dev/null 2>&1"   # run before every command (e.g. AFS tokens)
+# probe_timeout = 360               # seconds `site pick` waits for this site's probe

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# labllm -- minimal client for an OpenAI-compatible LLM endpoint (a lab's own server, Open WebUI, vLLM, ...).
+# Agents use it for cheap routed work (reading a failed job's log, a first draft of a small fix) whose result
+# they check before using it.
+#
+# Configure once, in ~/.config/ccorch/llm.env (sourced if present) or the environment:
+#   LLM_BASE      the server's OpenAI-compatible base URL, e.g. https://llm.example.org/api   (required)
+#   LLM_KEYFILE   file holding the API key (default ~/.config/ccorch/llm_key, chmod 600)
+#   LLM_KEY       the key itself (overrides the file)
+#   LLM_MODEL     model id (default: the first one the server lists)
+#   LLM_INSECURE  1 to skip TLS verification (only for a server with a self-signed certificate you trust)
+#
+#   labllm models                 list available models
+#   labllm chat "your question"   one-shot chat
+set -euo pipefail
+[ -f "$HOME/.config/ccorch/llm.env" ] && . "$HOME/.config/ccorch/llm.env"
+BASE="${LLM_BASE:?set LLM_BASE (see the header of $0)}"
+KEYFILE="${LLM_KEYFILE:-$HOME/.config/ccorch/llm_key}"
+KEY="${LLM_KEY:-$([ -f "$KEYFILE" ] && cat "$KEYFILE" || true)}"
+[ -n "$KEY" ] || { echo "no API key: put it in $KEYFILE or set LLM_KEY" >&2; exit 1; }
+cmd="${1:-chat}"; shift || true
+python3 - "$cmd" "$BASE" "$KEY" "${LLM_MODEL:-}" "${LLM_INSECURE:-0}" "$*" <<'PY'
+import sys, json, ssl, urllib.request
+cmd, base, key, model, insecure, prompt = sys.argv[1:7]
+ctx = ssl.create_default_context()
+if insecure == "1":
+    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+def call(path, body=None):
+    h = {"Authorization": "Bearer " + key}
+    if body is not None:
+        h["Content-Type"] = "application/json"
+    r = urllib.request.Request(base.rstrip("/") + path, data=body, headers=h)
+    return json.load(urllib.request.urlopen(r, context=ctx, timeout=180))
+def models():
+    d = call("/models"); items = d.get("data") or d
+    return [m.get("id") or m.get("name") for m in items]
+if cmd == "models":
+    print("\n".join(models()))
+elif cmd == "chat":
+    if not prompt.strip(): sys.exit("usage: labllm chat <prompt>")
+    model = model or models()[0]
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False}).encode()
+    print(call("/chat/completions", body)["choices"][0]["message"]["content"])
+else:
+    sys.exit("usage: labllm [models|chat <prompt>]")
+PY

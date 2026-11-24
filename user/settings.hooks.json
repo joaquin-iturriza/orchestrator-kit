@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "command": "python3 \"$HOME/.claude/hooks/dispatch.py\" ledger_guard.sh stop"}]}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 \"$HOME/.claude/hooks/dispatch.py\" ledger_guard.sh session-start"}]}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 \"$HOME/.claude/hooks/dispatch.py\" sleep_guard.sh"}]}]
+  }
+}

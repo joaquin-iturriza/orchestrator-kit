@@ -1,0 +1,44 @@
+# Per-site facts for this project: THE ONLY FILE (with sites/activate.sh) THAT NAMES A CLUSTER.
+#
+# Read by siteconf.py at import time; the site is CCORCH_SITE (exported by `site submit`) or sniffed from where this
+# checkout lives (`sniff` prefixes). Job scripts carry only job-owned settings (name, time, cpus, gpu count);
+# everything below is filled in at submit time. Site names must match ~/.config/ccorch/sites.toml.
+# Replace every <...> with your own values.
+myslurm:
+  sniff: ["<your storage root on this cluster, e.g. /scratch/>"]
+  env:
+    kind: venv                       # sites/activate.sh activates $PROJECT_DIR/.venv
+  project_dir: <root>/<project>      # where `site sync` checks the project out
+  scratch:     <root>/tmp
+  data_dir:    <root>/datasets
+  setup_commands:
+    - source <root>/<project>/sites/activate.sh
+  cluster:
+    scheduler: slurm
+    partition: <gpu partition>
+    account:   <your allocation>
+    gpu_flag:  "--gres=gpu:{n}"      # or "--gpus={n}", whatever the site's scheduler reads
+    mem:       32G                   # only where the site requires --mem
+  cpu:                               # CPU-only work (site run --job): no GPU hours
+    partition: <cpu partition>
+    account:   <your allocation>
+
+mycondor:
+  sniff: ["<code root, e.g. an EOS-like area>", "<submit root, e.g. an AFS-like area>"]
+  env:
+    kind: venv
+  project_dir: <code root>/<project>
+  sweep_dir:   <submit root>/<project>/sweeps   # where the scheduler is driven from (HTCondor may refuse some filesystems)
+  scratch:     <code root>/tmp
+  data_dir:    <code root>/datasets
+  setup_commands:
+    - source <code root>/<project>/sites/activate.sh
+  cluster:
+    scheduler: htcondor
+    flavour:   tomorrow                 # a default only: a job gets the shortest flavour covering its --time
+    mem:       16G
+
+local:
+  # this machine: paths are relative to the checkout; no scheduler
+  cluster:
+    scheduler: none

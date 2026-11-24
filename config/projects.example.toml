@@ -1,0 +1,42 @@
+# ~/.config/ccorch/projects.toml -- the projects, above the sites. One trunk branch each; a site never owns a branch.
+# Copied here by install.sh; replace every <...>.
+
+# Policies are settings, not code. [defaults.policy] applies to every project; [projects.<P>.policy] overrides it.
+[defaults.policy]
+gpu_cap_h = 30.0            # GPU-hours one work item may submit in 60 min before a decision must cover more
+gpu_cap_scarce_h = 10.0     # the same on a site whose sites.toml budget = "scarce"
+context_close = 300000      # tokens of an owner agent's context at which it writes its hand-off and closes
+notes_file = "notes.txt"   # where finished results are written up (plan ref / plan done read its \label{...} markers)
+opener = ""                 # a word every main-session reply must start with ("" = no such rule)
+# deletion on a site by hand is refused under these paths (regex), except through the pruning tools (regex)
+data_paths = '\bdatasets?\b|DATA_DIR|\bruns\b|checkpoints?'
+prune_tools = 'prune_site\.sh'
+# Stop-gate conditions switched off for every project (plan_check.py:<condition>): these three enforce one
+# researcher's figure and reporting conventions; delete a line to turn its check on.
+checks_off = ["plan_check.py:figure_pairs", "plan_check.py:result_table", "plan_check.py:figures_handed_back"]
+
+[projects.toy]
+repo      = "<git URL of the project, e.g. git@<host>:<you>/toy.git>"
+local     = "~/work/toy"
+branch    = "trunk"
+sites     = ["myslurm"]
+remote_name = "toy"           # its directory under the site's root
+ledger    = true              # decisions and work items enforced: site submit/copy/run need --item
+plan_check = true             # the project's Stop gate reads plan/plan.yaml (tools/plan.py)
+not_code  = ["plan"]          # plan writes commit plan/; site sync's dirty check leaves it out
+# submit_name = "toy"         # HTCondor sites: the directory under submit_root, when it differs
+# pip_extras  = "dev"         # pyproject extras `site env` installs
+# login_scripts = ["tools/check_data.py"]   # the only scripts `site run` may start on a login_cap site
+# maintain  = ["python3 tools/<housekeeping>.py"]   # run by `site supervise` every pass, in the checkout
+# selftest  = ["python3 -m pytest -q tests/test_hooks.py"]   # the guards' own tests, every pass
+
+# [projects.toy.policy]       # overrides for this project only
+# gpu_cap_h = 10.0
+
+# Run ends sorted without a model (site_runends.py): clean / at its planned limit / broke, from the log.
+[projects.toy.run_ends]
+enabled = true
+end_markers = ['RUN_DONE']
+error_patterns = ['Traceback', '[Oo]ut of memory', 'No space left on device']
+targets_cmd = "python3 tools/plan.py targets --json"
+collections_cmd = "python3 tools/plan.py collections --json"
