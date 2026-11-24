@@ -32,6 +32,14 @@ CFG_DIR = os.path.expanduser("~/.config/ccorch")
 SITES   = os.path.join(CFG_DIR, "sites.toml")
 PROJS   = os.path.join(CFG_DIR, "projects.toml")
 HOME    = os.environ.get("CCORCH_HOME") or os.path.expanduser("~/.local/share/ccorch")   # tests: a copy
+# the kit's state directory under $HOME on every site (gate, wrappers, CPU-job results): another name keeps a second
+# installation on the same cluster account from overwriting the first one's gate
+REMOTE_DIR = os.environ.get("CCORCH_REMOTE_DIR", ".ccorch")
+
+
+def _rd(text):
+    """`text` with the default remote state dir replaced by REMOTE_DIR."""
+    return text.replace("$HOME/.ccorch", "$HOME/" + REMOTE_DIR).replace('".ccorch"', '"%s"' % REMOTE_DIR)
 DB      = os.path.join(HOME, "runs.db")
 STORE   = os.path.join(HOME, "artifacts")      # tier-0 mirror, always local
 
@@ -105,6 +113,7 @@ def db():
 
 # ------------------------------------------------------------------ ssh
 def ssh_cmd(sc, inner, tty=False, gpu=False):
+    inner = _rd(inner)
     alias = sc.get("ssh_gpu" if gpu else "ssh")
     # The command's own output starts after OUT_MARK: anything the remote shell prints before it (CC-IN2P3's login
     # notice, profile noise) is dropped by strip_banner whatever its wording. Not for an interactive tty.
@@ -1326,7 +1335,7 @@ def cmd_shell(a):
 # ------------------------------------------------------------------ env
 def run_ssh_input(sc, script, timeout=3600):
     """Run a whole bash script on the site through stdin (no quoting games)."""
-    p = subprocess.run(ssh_cmd(sc, "bash -s"), input=script.encode(),
+    p = subprocess.run(ssh_cmd(sc, "bash -s"), input=_rd(script).encode(),
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     return p.returncode, strip_banner(p.stdout.decode("utf-8", "replace"), sc)
 
@@ -1345,10 +1354,14 @@ def project_recipe(pr):
 
 
 _PY_VERIFY = """
-import sys, torch
-print("verify python", sys.version.split()[0], "torch", torch.__version__,
-      "cuda", torch.version.cuda, "exe", sys.executable)
-c = (torch.version.cuda or "0").split(".")[0]
+import sys
+try:
+    import torch                  # a project without torch is verified by its python alone
+except ImportError:
+    torch = None
+print("verify python", sys.version.split()[0], "torch", torch and torch.__version__,
+      "cuda", torch and torch.version.cuda, "exe", sys.executable)
+c = ((torch and torch.version.cuda) or "0").split(".")[0]
 if c.isdigit() and int(c) >= 13:
     sys.exit("FATAL: torch built for CUDA %s, which dropped sm_70 (V100)" % torch.version.cuda)
 """
@@ -1453,8 +1466,8 @@ def env_script(sc, pr, project, site, env, rebuild=False, force_shared=False):
         die("unknown env kind %r for %s@%s" % (kind, project, site))
     # the acceptance test is the thing jobs actually do: source activate.sh
     L += ["cat > /tmp/site-act.$$ <<'ACT'\nexport CCORCH_SITE=__SITE__\ncd __P__\n"
-          "source sites/activate.sh\npython -c 'import sys,torch; print(\"activate.sh ok:\", "
-          "sys.executable, torch.__version__)'\nACT",
+          "source sites/activate.sh\npython -c 'import sys; print(\"activate.sh ok:\", "
+          "sys.executable)'\nACT",
           "bash -l /tmp/site-act.$$ || { echo \"activate.sh FAILED\"; exit 12; }",]
     if os.path.exists(os.path.join(os.path.expanduser(pr["local"]), "sites", "setup.sh")):
         # the project's non-Python needs (MadGraph, caches, datasets, containers)
@@ -1479,6 +1492,14 @@ def cmd_env(a):
     script = env_script(sc, pr, a.project, a.site, env, a.rebuild, a.force_shared)
     if a.check:
         print(script)
+        return
+    if sc.get("login_cap"):
+        # a site whose login nodes take no scripts (sites.toml login_cap): the setup runs as a CPU job, and the same
+        # command again reads its result (exit 75 until then)
+        a.timeout, a.recurring = max(a.timeout, 1800), False
+        rc = run_as_job(a, sc, pr, script, "env %s" % a.project)
+        if rc:
+            sys.exit(rc)
         return
     print("  env %s @ %s (%s%s)" % (a.project, a.site, env.get("kind", "venv"),
                                     ": " + env["path"] if env.get("path") else ""))
@@ -2266,7 +2287,7 @@ def run_as_job(a, sc, pr, inner, cmd):
               "if [ -n \"$q\" ]; then echo \"CCJ_PENDING $q\"; "
               "elif [ -z \"$got\" ] || [ {r} = 1 ]; then echo {b} | base64 -d > $j.sh; "
               "echo \"CCJ_SUBMITTED $(sbatch --parsable -J ccj_{k} {f} -c 1 -t {m} -o $j.log $j.sh 2>&1)\"; fi"
-              ).format(k=key, r=int(bool(a.recurring)), b=base64.b64encode(script.encode()).decode(), f=flags,
+              ).format(k=key, r=int(bool(a.recurring)), b=base64.b64encode(_rd(script).encode()).decode(), f=flags,
                        m=t // 60 + 5)
     rc, out = run_ssh(sc, remote, timeout=120)
     if rc:
@@ -2474,10 +2495,10 @@ def _zb64(text):
     return shlex.quote(base64.b64encode(gzip.compress(text.encode(), 9, mtime=0)).decode())
 
 
-SCHED_WRAP_FULL = ("{ mkdir -p $HOME/.ccorch/bin && printf %s " + _zb64(_gate_body()) +
+SCHED_WRAP_FULL = ("{ mkdir -p $HOME/.ccorch/bin && printf %s " + _zb64(_rd(_gate_body())) +
               " | base64 -d | gunzip > $HOME/.ccorch/bin/.ccorch_gate.py.$$ && mv -f $HOME/.ccorch/bin/.ccorch_gate.py.$$ "
               "$HOME/.ccorch/bin/ccorch_gate.py && for _c in sbatch condor_submit condor_submit_dag; do printf %s "
-              + _zb64(_WRAP_BODY) + " | base64 -d | gunzip > $HOME/.ccorch/bin/.$_c.$$ && chmod 755 $HOME/.ccorch/bin/.$_c.$$ && "
+              + _zb64(_rd(_WRAP_BODY)) + " | base64 -d | gunzip > $HOME/.ccorch/bin/.$_c.$$ && chmod 755 $HOME/.ccorch/bin/.$_c.$$ && "
               "mv -f $HOME/.ccorch/bin/.$_c.$$ $HOME/.ccorch/bin/$_c; done && "
               "export PATH=$HOME/.ccorch/bin:$PATH; } 2>/dev/null")
 
