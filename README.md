@@ -140,5 +140,6 @@ site runs --project toy;  site logs <run>;  site fetch <run>
   copy has not yet been run against a cluster on someone else's account.
 - `bin/site` is one large file; splitting it into modules is welcome.
 - The workflow assumes one development branch per project, `trunk`, which every site checks out.
-- Several comments in the code still record the incident that motivated a check, with its date. They are history,
-  not instructions.
+- The kit keeps its state on each site under `~/.ccorch`; set `CCORCH_REMOTE_DIR` (e.g. `.ccorch_kit`) to keep a
+  second installation on the same cluster account apart from the first. On a site with `login_cap`, `site env` runs
+  its setup as a CPU job: run the same command again to read its result.

@@ -5,7 +5,9 @@ cmds: \bsite\s+\S+\s+(ccin2p3|jeanzay|lxplus)\b, \b(sbatch|scontrol|squeue|condo
   have internet. It prints a login notice before every command's output; `site` strips it (`strip_banner`: each remote
   command starts with a marker and what precedes it is dropped, plus the notice's frame anywhere; `site sync` sends a
   bundle, as git's ssh protocol breaks on it). A parser reading raw ssh output from its first line breaks on it (it
-  once routed GPU jobs to the CPU partition: "Requested node configuration is not available").
+  once routed GPU jobs to the CPU partition: "Requested node configuration is not available"). Login nodes take no
+  scripts (`login_cap`): `site env` runs as a CPU job there. The anaconda modules are denied; a venv starts from a
+  pure Python module (`module load Programming_Languages/python/3.13.7`).
 - Jean Zay: no `--qos`, no `--mem`; compute nodes have NO internet (stage data first); inode quota nearly full (no new
   conda/venv with its own torch).
 - lxplus: HTCondor submits only from AFS (`SUBMIT_DIR`), code and data on EOS; 2FA: the ssh master is opened by the
